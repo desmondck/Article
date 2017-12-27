@@ -1,0 +1,48 @@
+**目录**
+[1. PhxPaxos源码分析之关于PhxPaxos](http://www.jianshu.com/p/9f1a874a39e5)
+[2. PhxPaxos分析之网络基础部件](http://www.jianshu.com/p/d9434ef602b3)
+[3. PhxPaxos源码分析之Proposer、Acceptor](http://www.jianshu.com/p/2a78c6215e6d)
+[4. PhxPaxos源码分析之Learner](http://www.jianshu.com/p/ab4a33989a98)
+[5. PhxPaxos源码分析之状态机](http://www.jianshu.com/p/89377cc9b405)
+[6. PhxPaxos源码分析之归档机制](http://www.jianshu.com/p/a43fa22a2851)
+[7. PhxPaxos源码分析之整体架构](http://www.jianshu.com/p/01f048419328)
+****
+**注：本章主要内容截取自[github phxpaxos官方介绍](https://github.com/Tencent/phxpaxos/blob/master/README.zh_CN.md)**
+#1.1 关于phxpaxos
+PhxPaxos是腾讯公司微信后台团队自主研发的一套基于Paxos协议的多机状态拷贝类库。它以库函数的方式嵌入到开发者的代码当中， 使得一些单机状态服务可以扩展到多机器，从而获得强一致性的多副本以及自动容灾的特性。 这个类库在微信服务里面经过一系列的工程验证，并且我们对它进行过大量的恶劣环境下的测试，使其在一致性的保证上更为健壮。
+
+#1.2 特性
+
+* 基于Lamport的 Paxos Made Simple 进行工程化，不进行任何算法变种。
+* 使用基于消息传递机制的纯异步工程架构。
+* 每次写盘使用fsync严格保证正确性。
+* 一次Propose（写入数据）的Latency为一次RTT，均摊单机写盘次数为1次。
+* 使用点对点流式协议进行快速学习。
+* 支持Checkpoint以及对PaxosLog的自动清理。
+* 支持跨机器的Checkpoint自动拉取。
+* 一个PhxPaxos实例可以同时挂载多个状态机。
+* 可使用镜像状态机模式进行Checkpoint的自动生成。
+* 内置Master选举功能。
+* 线上数据的实时增量checksum校验。
+* 网络、存储、监控、日志模块插件化，可由开发者自定义。
+* 基于Paxos算法的安全的成员变更。
+* 基于Paxos算法的集群签名保护，隔离非法签名的错误机器。
+* 自适应的过载保护。
+#1.3 局限
+
+* 一个PhxPaxos实例任一时刻只允许运行在单一进程（容许多线程）。
+* 这个类库没有内建对client-server的支持，开发者必须将类库的代码嵌入到自己的服务器代码里面，以实现这个功能。
+* PhxPaxos只容许运行在64位的Linux平台。
+
+#1.4 总结
+PhxPaxos是Paxos的工程化实现。除了实现Paxos算法之外，还做了很多工程优化，包括性能(RTT、本地落盘次数等)、基础部件插件化等。
+
+本系列章节将深入分析PhxPaxos的各个部分，从网络基础部件讲起，分析paxos的算法实现、checkpoint机制，最后从更高层上阐述phxpaxos的架构实现。本系列文章将覆盖“1.1 特性”中描述的所有特性。
+
+本文基于 phxpaxos v1.1.2。
+****
+[1] Leslie Lamport. [Paxos made simple](https://www.microsoft.com/en-us/research/publication/paxos-made-simple/?from=http%3A%2F%2Fresearch.microsoft.com%2Fen-us%2Fum%2Fpeople%2Flamport%2Fpubs%2Fpaxos-simple.pdf). 2001.11.01
+[2] 随安居士. [Paxos made simple 释译](http://www.jianshu.com/p/24ea92091fbf). 2017.03.09
+[3] 微信后台团队. [微信自研生产级paxos类库PhxPaxos实现原理介绍](https://mp.weixin.qq.com/s?__biz=MzI4NDMyNTU2Mw==&mid=2247483695&idx=1&sn=91ea422913fc62579e020e941d1d059e#rd). 2016.06.22
+****
+【转载请注明】随安居士. [1. PhxPaxos源码分析之关于PhxPaxos](http://www.jianshu.com/p/9f1a874a39e5). 2017.11.13

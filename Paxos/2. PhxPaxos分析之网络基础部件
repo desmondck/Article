@@ -1,0 +1,275 @@
+**目录**
+[1. PhxPaxos源码分析之关于PhxPaxos](http://www.jianshu.com/p/9f1a874a39e5)
+[2. PhxPaxos分析之网络基础部件](http://www.jianshu.com/p/d9434ef602b3)
+[3. PhxPaxos源码分析之Proposer、Acceptor](http://www.jianshu.com/p/2a78c6215e6d)
+[4. PhxPaxos源码分析之Learner](http://www.jianshu.com/p/ab4a33989a98)
+[5. PhxPaxos源码分析之状态机](http://www.jianshu.com/p/89377cc9b405)
+[6. PhxPaxos源码分析之归档机制](http://www.jianshu.com/p/a43fa22a2851)
+[7. PhxPaxos源码分析之整体架构](http://www.jianshu.com/p/01f048419328)
+****
+#2.1 背景
+Paxos 算法解决是一个分布式系统如何就某个值（决议）达成一致，因此网络通信是该算法可正常运行的基础。
+
+在Paxos中，涉及网络通信的角色包括：
+* **Proposer**：Paxos提案发起者。
+* **Acceptor**：Paxos提案接收者。
+* **Learner**：Paxos确定值的学习者。
+
+除算法本身角色外，PhxPaxos还设定了下述角色需要网络通信：
+* **Folloer Node**：Paxos集群的跟随者。
+Follower指定一个运行Paxos协议的节点用于数据同步，它不参与Paxos算法。Follower更像传统意义上的同步备，当Paxos算法节点确定一个值后，将数据同步到Follower节点。但若follow的节点无法同步数据，Follower可以向整个Paxos集群发起learn请求。
+* **CheckpointMgr**：镜像数据管理者。
+指引业务生成镜像数据，一旦指定instance id之前的镜像数据产生，理论上就可以移除该instance id之前的Paxos Log数据，以免空间的无限扩展。关于CheckpointMgr后面将单独讨论。
+
+#2.2 网络层架构
+按协议划分，PhxPaxos支持TCP、UDP两种通信协议；按操作划分，支持网络数据读、写两种操作；按角色划分，分为客户端、服务器两种角色。在PhxPaxos中，服务器只负责读取操作，客户端只负责写入操作。因此，在最简场景下，我们需要4个封装类，分别如下：
+* **TCPClient**：TCP客户端。
+* **TCPServer**：TCP服务器。
+* **UDPSender**：UDP数据发送器。
+* **UDPReceiver**：UDP数据接收器。
+
+而PhxPaxos中的实际实现要比这复杂的多，来看一组网络架构图：
+![PhxPaxos网络架构图](http://upload-images.jianshu.io/upload_images/5135780-6afebe0e29bc14c2.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+大致分为如下几部分：
+* **UDP封装层**
+**UDPRecv**：开启指定端口的UDP通信通道，启动独立线程、通过poll方式接收网络消息，最后将数据交给*NetWork*处理。
+**UDPSend**：创建UDP Socket，启动独立线程、异步触发式发送消息。提供AddMessage接口接收需发送的数据内容，将其放入消息队列，供线程消费。
+* **TCP封装层**
+包括ServerSocket、Socket、Event、EventLoop、TcpAcceptor、TcpClient、TcpRead、TcpWrite、TcpIoThread。
+见2.3节。
+* **整体网络抽象层**
+包括NetWork、DfNetWork、MsgTransport、Communicate。
+见2.4节。
+
+#2.3 TCP封装层
+为了清楚了解作者意图，来看TCP封装层类图：
+![TCP封装层类图](http://upload-images.jianshu.io/upload_images/5135780-421e2215890a2664.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
+各个类功能说明如下：
+* **Socket**
+Socket客户端通信封装类，负责TCP连接建立，数据收发.
+* **ServerSocket**
+Socket服务器通信封装类，负责Tcp服务器启动、监听.
+* **Event**
+		网络事件接收器(handler)，负责操作Socket读写
+* **EventLoop**
+	网络事件分发器(dispatcher)，支持基于socket的订阅，每个socket配对一个event。当前主要分发两类网络事件：发送(write)、接收(read)。采用epoll实现网络事件监听处理，并对外屏蔽实现细节。
+* **TcpAcceptor**
+本节点TCP服务器，负责监听其他节点的客户端连接。每收到一个客户端连接，配置一个读操作的Socket并配对一个Event
+* **TcpClient**
+TCP客户端，负责发送数据到其他节点。每个ip、port配置一个写操作的Socket，并配对一个Event。
+* **TcpRead**
+启动TCP Acceptor线程，接收其他客户端连接。启动EventLoop，接收已连接客户端的数据包。
+* **TcpWrite**
+启动EventLoop，发送TcpClient接收到的数据包。
+* **TcpIoThread**
+对外的TCP操作封装类，其自身并不启动线程，仅负责整合TcpRead、TcpWrite，对外提供AddMessage接口。
+```
+    void TcpIOThread :: Stop()
+    {
+        if (m_bIsStarted)
+        {
+            m_oTcpRead.Stop();
+            m_oTcpWrite.Stop();
+        }
+
+        PLHead("TcpIOThread [END]");
+    }
+
+    int TcpIOThread :: Init(const std::string& sListenIp, const int iListenPort)
+    {
+        int ret = m_oTcpRead.Init(sListenIp, iListenPort);
+
+        if (ret == 0)
+        {
+            return m_oTcpWrite.Init();
+        }
+
+        return ret;
+    }
+
+    void TcpIOThread :: Start()
+    {
+        m_oTcpWrite.start();
+        m_oTcpRead.start();
+        m_bIsStarted = true;
+    }
+
+    int TcpIOThread :: AddMessage(const std::string& sIP, const int iPort, const std::string& sMessage)
+    {
+        return m_oTcpWrite.AddMessage(sIP, iPort, sMessage);
+    }
+
+```
+	
+代码结构还算清晰，但是不是总觉得哪里不对？没关系，先顺着作者的思路看完。
+#2.4 整体网络抽象层
+相比UDP、TCP封装层，整体网络抽象层是更高一级的概念。PhxPaxos中属于该层的网络抽象类如下：
+* **NetWork**
+整体网络抽象类，对外屏蔽上述所有TCP\UDP实现，支持接收、发送网络数据。接收到的网络数据交由处理器处理（当前为Node对象）。
+```
+    class NetWork
+    {
+    public:
+        virtual void RunNetWork() = 0;
+        virtual void StopNetWork() = 0;
+
+        virtual int SendMessageTCP(const std::string& sIp, const int iPort, const std::string& sMessage) = 0;
+        virtual int SendMessageUDP(const std::string& sIp, const int iPort, const std::string& sMessage) = 0;
+
+        int OnReceiveMessage(const char* pcMessage, const int iMessageLen);
+    };
+```
+* **DfNetWork**
+内置的网络实现类，负责管理UDPRecv、UDPSend、TpcIoThread(内含TcpRead、TcpWrite)。
+```
+    class DFNetWork : public NetWork
+    {
+    public:
+        int Init(const std::string& sListenIp, const int iListenPort);
+
+        //super interface
+        ...
+    private:
+        UDPRecv m_oUDPRecv;
+        UDPSend m_oUDPSend;
+        TcpIOThread m_oTcpIOThread;
+    };
+```
+* **MsgTransport**
+网络消息发送器，接口类。
+```
+    class MsgTransport
+    {
+    public:
+        virtual int SendMessage(const nodeid_t iSendtoNodeID, const std::string& sBuffer,
+                                const int iSendType = Message_SendType_UDP) = 0;
+        virtual int BroadcastMessage(const std::string& sBuffer,
+                                     const int iSendType = Message_SendType_UDP) = 0;
+        virtual int BroadcastMessageFollower(const std::string& sBuffer,
+                                             const int iSendType = Message_SendType_UDP) = 0;
+        virtual int BroadcastMessageTempNode(const std::string& sBuffer,
+                                             const int iSendType = Message_SendType_UDP) = 0;
+    };
+```
+
+* **Communicate**
+网络消息发送器，实现类。内部读取配置信息并对NetWork接口的简单封装。
+```
+    class Communicate : public MsgTransport
+    {
+    public:
+       //super interface 
+       ...
+    private:
+        Config* m_poConfig;
+        NetWork* m_poNetwork;
+
+        nodeid_t m_iMyNodeID;
+        size_t m_iUDPMaxSize;
+    };
+```
+
+其实，这还没完，还有一个不属于“整体网络抽象层”的网络抽象，在base.h中。来看和网络相关的接口定义:
+```
+    class Base
+    {
+    public:
+        int PackMsg(const PaxosMsg& oPaxosMsg, std::string& sBuffer);
+        int PackCheckpointMsg(const CheckpointMsg& oCheckpointMsg, std::string& sBuffer);
+        void PackBaseMsg(const std::string& sBodyBuffer, const int iCmd, std::string& sBuffer);
+        static int UnPackBaseMsg(const std::string& sBuffer, Header& oHeader, size_t& iBodyStartPos, size_t& iBodyLen);
+
+    protected:
+        virtual int SendMessage(const nodeid_t iSendtoNodeID, const PaxosMsg& oPaxosMsg, const int iSendType = Message_SendType_UDP);
+        virtual int BroadcastMessage(
+            const PaxosMsg& oPaxosMsg,
+            const int bRunSelfFirst = BroadcastMessage_Type_RunSelf_First,
+            const int iSendType = Message_SendType_UDP);
+        int BroadcastMessageToFollower(
+            const PaxosMsg& oPaxosMsg,
+            const int iSendType = Message_SendType_TCP);
+        int BroadcastMessageToTempNode(
+            const PaxosMsg& oPaxosMsg,
+            const int iSendType = Message_SendType_UDP);
+    protected:
+        int SendMessage(const nodeid_t iSendtoNodeID, const CheckpointMsg& oCheckpointMsg,
+                        const int iSendType = Message_SendType_TCP);
+
+    protected:
+        Config* m_poConfig;
+        MsgTransport* m_poMsgTransport;
+        Instance* m_poInstance;
+    };
+```
+base是三个主要角色(Proposer、Accepor、Learner)的基类，这里网络相关操作主要包括打包和发送两种。和MsgTransport的发送接口相比有何区别呢？base中的发送函数负责打包、发送以及基于Instance对象的部分特殊处理。以其中的一个SendMessage为例：
+```
+    int Base :: SendMessage(const nodeid_t iSendtoNodeID, const PaxosMsg& oPaxosMsg, const int iSendType)
+    {
+        if (m_bIsTestMode)
+        {
+            return 0;
+        }
+
+        BP->GetInstanceBP()->SendMessage();
+        //本节点立即处理
+        if (iSendtoNodeID == m_poConfig->GetMyNodeID())
+        {
+            m_poInstance->OnReceivePaxosMsg(oPaxosMsg);
+            return 0;
+        }
+        //打包
+        string sBuffer;
+        int ret = PackMsg(oPaxosMsg, sBuffer);
+        if (ret != 0)
+        {
+            return ret;
+        }
+        //发送
+        return m_poMsgTransport->SendMessage(iSendtoNodeID, sBuffer, iSendType);
+    }
+```
+#2.5 架构探讨
+前面将PhxPaxos的网络层抽象类全部过了一遍，现在我们来窥视下作者的意图，并进一步探讨是否存在更合理的架构。
+
+PhxPaxos的网络抽象层存在一个明显的分界点：NetWork抽象类。NetWork及其之下抽象是基于纯粹网络的，业务无关的；NetWork之上的是业务相关的。NetWork做为明显分界点到额另外一个原因是：允许PhxPaxos的使用者注册自己的NetWork实现类，以替换内置的DfNetWork。来看NetWork及其之下的抽象：
+XXX
+
+按文章中最初提到的观点，理想中的NetWork应该只包含四个类：TCPClient、TCPServer、UDPSender、UDPReceiver。当前UDP和预期一致，但TCP当前一共有9个类，比预想的多了7个。其中Socket和ServerSocket的抽象是合理的、粒度恰当的，Event概念引入及抽象略显奇怪。EventLoop的定位应该是一个Package Dispather(网络数据分发器)，它反向依赖了TcpAcceptor、TcpClient。而且在Phxpaxos场景下读写操作是完全隔离的。因此，Event、EventLoop的功能垂直拆分到TcpClient和TcpServer，薄抽象层TcpRead、TcpWrite、TcpIoThread移除或许更为合理。
+
+针对NetWork层说几点：
+* **NetWork**应该是一个接口，而非抽象类。
+* **NetWork**不应该被TcpIOThread、TcpRead、TcpWrite、TcpAcceptor、TcpClient反向依赖。
+* **NetWork**中的OnReceiveMessage应该被移除，TCP中收到的消息应该提供单独的接口抽象(MessageHandler)。基于PhxPaxos的实现，由Node实现这个接口是合适的。
+```
+class MessageHandler
+{
+    virtual  int OnReceiveMessage(const char* pcMessage, const int iMessageLen) = 0;
+}
+```
+再来看MsgTransport、Communicate、base这三个类。因为NetWork只做纯网络的抽象，直接交由上层使用并不合适，因此基于业务抽象的MsgTransport接口确有必要。但这一层抽象并不彻底，进而又在base中做了二次封装。从设计上来看，有如下几个缺陷：
+* base是Learner、Proposer、Accepor的基类，应该只包含角色共识逻辑，网络消息处理不属于其职责。
+* base中包含CheckpointMsg的消息处理，但该消息是Checkpoint机制专有的处理方式，并不适合放到公共的base类中。
+
+个人认为合理的做法应该是：
+* base中所有网络相关操作移除，网络发送部分功能移至Communicate。Communicate做为Phxpaxos的业务网络抽象层。
+* 网络数据打包、解包部分拆分抽单独的PackageUtil类处理，该类仅被Communicate使用。
+#2.6 总结
+Phxpaxos基于socket、poll、epoll构建自己的网络层，支持UDP、TCP两种通信方式。网络层一共启动了如下五个线程;
+* **UDPRecv线程**
+处理来自其他节点的UDP数据。
+* **UDPSend线程**
+处理本节点发往其他节点的UDP数据。
+* **TcpAcceptor线程**
+处理来自其他节点的连接请求。
+* **TcpRead线程**
+处理来自其他节点的Tcp数据。
+* **TcpWrite线程**
+处理本节点发往其他节点的Tcp数据。
+
+NetWork接口对外屏蔽了上述细节，并且允许用户替换为自己的网络部件。而Phxpaxos使用的是更上层的MsgTransport，其包含了和Phxpaxos业务相关的一些操作，如打包、本节点特殊处理等。
+
+在完成了Communicate之后，我们有了一个有效的网络通信机制，下一步，让我们真正开始了解PhxPaxos的核心 --- Paxos算法实现。
+****
+【转载请注明】随安居士. [2. PhxPaxos分析之网络基础部件](http://www.jianshu.com/p/d9434ef602b3). 2017.11.13
+

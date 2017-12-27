@@ -1,0 +1,303 @@
+本文阐述了大型系统由Mongodb切换至PostgreSQL的工程实践及经验教训。
+#背景
+系统早期选型时，出于分布式，扩缩容、等方面考虑采用了MongoDB，但随着系统的演进及对可靠性、事务等的诉求，关系型数据库似乎是一个更好的选择。
+在IT系统中，数据存储是整个系统的核心，数据库选型、切换甚至版本升级都会对整个系统产生重大影响。
+本次切换中，我们充分比较了PostgreSQL、Oracle、MySql等关系型数据库，最终我们决定采用PostgreSQL，并在其之上完成简易的dbproxy功能，同时保持底层存储的分布式特性和可扩展性。
+选择PostgreSQL主要有以下几个原因：
+* 事务。除本地事务外，还支持两阶段事务，满足分布式一致性的诉求。
+* 性能。在典型场景下，PostgreSQL的性能极为出色，在读取上性能也要优于Mongodb。
+* JSON类型支持。MongoDB的数据存储格式为JSON，原有系统中存在诸多使用MongoDB接口访问数据库的场景，选择一款支持JSON的数据库更容易完成数据库迁移。
+
+#目标
+项目达成以下目标：
+1. 由MongoDB到PostgreSQL的平滑迁移。
+平滑迁移主要是指对外保留现有的MongoDB接口，内部数据存储由MongoDB切换至PostgreSQL数据库。对于遗留系统或具有一定规模的(分布式)系统，数据访问层作为公共数据接口被大量的业务使用。如果由于数据切换废弃原有的抽象接口，而全部采用全新接口，后果将是灾难性的。
+2. 提供新的、支持事务、分布式事务或其它关系型数据库具备标准能力的数据访问层。
+Hibernate作为DAO层，扩展并丰富现有的Annotation。
+3. 支持分片、主备部署、可靠性增强等。
+
+#技术分析
+##接口定义
+抛开实现细节，来看典型Mongodb的DAO层接口定义：
+```
+class UnifiedDAO
+{
+  //通用接口
+  public boolean insert(T pojo)
+  //通用接口
+  public boolean save(T pojo)
+  //通用接口
+  public boolean update(T pojo)
+  //通用接口??
+  public List find(String condition, ...)
+}
+```
+原有的增、删、改接口足够通用，即便我们基于RDBMS数据库重新设计或者直接采用Hibernate也大体如此。find接口这里做了简化，仅传入一个condition及多个变长参数，来看典型用法：
+```
+UnifiedDAO personDao = new UnifiedDAO();
+//查找名字为Joe，年龄为18岁的person
+personDao.find("{name:#, age:#}", "Joe", 18);
+//找出所有名字中包含jo的条目
+personDao.find("{name: {$regex: #}}", "jo.*")
+//age < 100
+personDao.find({age:{$lt:100}})
+// age < 100 and age > 20
+personDao.find({age:{$lt:100,$gt:20}})
+// age != 11
+personDao.find({age:{$ne:11}})
+// age in [11, 22]
+personDao.find({age:{$in:[11,22]}})
+// age = 11 or age = 22
+personDao.find({$or:[{age:11},{age:22}]})
+// age = 11 or name equal 'xttt'
+personDao.find({$or:[{age:11},{name:'xttt'}]})
+```
+查询接口暴露原生的Mongo语法，业务根据需要自己组装查询条件，并返回查询结果。Mongo语法和SQL语法完全不同，我们需要：**将Mongo的CQL转换为postgres的SQL语句**。
+##存储差异
+Mongodb为文档型数据库，数据以JSON形式存储，并没有Schema概念。而PostgreSQL数据以表-行-列形式存储。No-shema的数据内容是任意的，而schema表是需要预先定义的，将运行时任意插入的数据全部罗列出来并定义成列是不现实的。
+这里需要用到前文提到的一个特性--PostgreSQL对JSON类型支持。Postgres中提供的类型叫jsonb，它是json的一个变种。关于jsonb类型可参见如下链接：
+> [Documentation: 9.5: JSON Types](https://www.postgresql.org/docs/9.5/static/datatype-json.html)
+[JSON Functions and Operators](https://www.postgresql.org/docs/9.5/static/functions-json.html)
+
+对于现有的Mongo数据，我们的想法是：将mongo的每一个collection定义成一张数据表，并将Mongo中的json数据转储到PostgreSQL中。数据表定义如下：
+```
+create table collection_name
+{
+  document jsonb;
+}
+//增加基于document->_id的索引字段，提升查询效率。
+```
+但MongoDB和JSON相比额外支持了那么多的数据类型，在JSON中要怎么处理呢？又怎么把实体对象转换为PostgreSQL中的JSONB数据呢？明确我们的下一个目标：**正确处理MongoDB支持的各种数据类型，做到『无损转换』**。在增、删、改时，将实体对象转换为JSONB数据；在查找时，将JSONB数据转换为实体对象。
+#工程实践
+从接口调用开始，简化处理如下流程：
+* 增、删、改：实体对象序列化为JSONB数据 -> 通过JDBC入库
+* 查找：Cql转换为SQL ->通过JDBC访问数据库 -> JSONB数据反序列化为实体对象
+
+##词法分析
+工程中，我们采用JONGO作Mongo数据访问，那么JONGO必然做了Cql的词法分析。查看JONGO源码，发现方法如下：
+```
+DBObject dbObject = bsonQueryFactory.createQuery(cql, parameters).toDBObject();
+```
+DBObject是树状结构，并已将所有的参数标记替换为实际参数数据。后续，我们涉及的Cql讨论将基于DBObject展开。
+##语法差异
+在开始语法具体细节讨论之前，先来看下相同操作在MongoDB、PostgreSQL下的语法差异：
+
+![](http://upload-images.jianshu.io/upload_images/5135780-f476056dfb3edf7b.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
+* **数据类型**。Cql对所有数据类型处理方式上保持一致，并且支持任意形式的操作符组合。PostgreSQL按日期类型、数字类型、正则表达式、其它类型等语法上有所不同。
+* **操作类型**。Cql对所有操作类型处理方式上保持一致，并且支持任意形式的操作符组合。PostgreSQL在相等、大于、小于等操作处理语法基本一致，在包含不包含处理语法一致。
+* **嵌套查询**。Cql嵌套查询和非嵌套查询语法并无明显区别。PostgreSQL对于数组、非数组的嵌套查询处理方式不同，且仅支持相等操作的嵌套查询。
+* **其它**。需要注意两点：第一、并非所有的Mongo操作都可以转换成合理的SQL；第二、本文并未穷尽所有的Mongo操作。
+
+> Postgresql中JSONB支持的类型及操作符
+![](http://upload-images.jianshu.io/upload_images/5135780-641ab620897ea332.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+![](http://upload-images.jianshu.io/upload_images/5135780-66d9bc368ac061ec.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+上面是PostgreSQL官方手册中截取的JSONB支持的类型及操作符描述。在操作不同类型或者操作时，postgres最常用的语法：
+* -> ：int、boolean类型操作，数组类型操作
+* ->> ：string类型操作，数组类型操作
+* \#> ：复合路径下，int、boolean类型操作，数组类型操作
+* \#>> : 复合路径下，string类型操作，数组类型操作
+细心的朋友可能已经注意到，在『语法差异对比』一节中，我们根本没用到->和#>，而是采用了->>、#>> + ::number等指定类型方式。这是因为，语法上二者是等价的，但工程实践上更适合做一致处理。
+
+既然在数据类型、操作类型、嵌套查询等方面存在差异，那么我们需要从CQL中提取这些信息，以便进行CQL->SQL转换。通过JONGO完成词法分析后CQL已被转换成了DBObject，那么DBObject中是否包含了这些信息呢？实践证明：操作类型、是否为嵌套查询可以提取，但数据类型却有可能获取失败。这是因为Cql字符串转换到DBObject时某些类型丢失了(或者说是退化)，如日期退化成了字符串。
+通过DBObject无法获取正确的数据类型，是不是语法转换就进行不下去了呢？来回顾一下数据处理的整个流程：首先，把Cql转换为SQL，随后通过JDBC访问数据库，最后将JSONB数据反序列化成**实体对象**。到这里你可能已经明白了，除了CQL外，还有一个隐藏输入----实体对象，实体对象上必然有数据的实际类型，不是吗？最终做法如下：根据实体类(Entity Class)及查询key值做反射，将key值按『.』做分割，逐层查找Entity Class字段获取正确类型。出于性能考虑，采用延迟加载+缓存策略，保证每个Entity Class仅被反射处理一次。
+##语法转换
+参见『语法差异对比』一节，表面上看MongoDB和PostgreSQL的语法差异很大。进一步分析，来看下图：
+
+![](http://upload-images.jianshu.io/upload_images/5135780-0562a463cc13cc25.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+其中蓝色代表mongodb语法元素，绿色代表postgresql语法元素。将Cql和SQL拆解成语法树后，二者除操作符不同（$eq换成=）外，语法树完全一致。之所以看起来差别很大是因为：Cql采用的是前序遍历，而SQL采用的是中序遍历。
+此处，只是简单列举了基本CQL的语法树，部分语法上有所不同，代码处理时需要定制，本文不详细说明。
+###代码实现
+定义操作符枚举类型，用于操作符转换。
+```
+enum SqlOperator
+{
+  Or("$or", "or"),
+  And("$and", "and"),
+  Equal("$eq","="),
+  NotEqual("$ne", "!=");
+  LessThan("$lt", "<"),
+  GreatThan("$gt", ">"),
+  LessThanEqual("$lte", "<="),
+  GreatThanEqual("$gte", ">="),
+  In("$in", "in"),
+  NotIn("$nin", "not in"),
+  ElementMatch("$elemMatch", ""),
+  Regex("$regex", " ~ ")
+}
+```
+定义语法树节点类。这里没有采用二叉树，因为对于与、或这两种操作可以支持任意多个子元素存在。
+```
+struct SyntaxElement
+{
+  SqlOperator sqlOperator;
+  String key;
+  Object value;
+  List childElements;
+}
+```
+定义一个SQL存储类。没有直接将Cql转换为SQL字符串而是单独定义一个Sql类，主要是出于工程上防SQL注入的考虑。
+```
+struct PreparedSql
+{
+  String sql;
+  List sqlParameters;
+}
+struct SqlParameter
+{
+  String parameter;
+  SqlDataType sqlDataType;
+}
+//Jsonb类型的参数处理方式和其它类型不同，需要单独定义
+enum SqlDataType
+{
+  Jsonb,
+  Other
+}
+```
+创建SQL生成器，负责Cql转换为SQL。这里，工程实现上最复杂的、容易出错的是『将DBObject转换为语法树』。我们需要小心处理每种细微差异，并将其统一到SyntaxElement上来。
+```
+class SqlGenerator
+{
+  public PreparedSql getPreparedSql(String tableName, String cql, Object... parameters)
+  {
+    //将字符串转换为DBObject
+    dbObject = bsonQueryFactory.createQuery(cql, parameters).toDBObject();
+    //将DBObject转换为语法树
+    SyntaxElement sqlElement = syntaxAnalysis(dbObject);
+    //采用中序遍历生成SQL
+    PreparedSql preparedSql = generatePreparedSql(sqlElement);
+  }
+}
+```
+SyntaxElement+SqlOperator都属Model类，并无任何函数。我们还需要定义一组针对SqlOperator的语法转换规则：
+```
+switch(sqlOperator)
+{
+  case Regex:
+  //特殊处理
+  case ElementMatch:
+  //特殊处理
+  case And:
+  case Or:
+  case Equal:
+  //标准处理
+}
+```
+至于怎么将PreparedSql转换为PreparedStatement，再通过JDBC访问PostgreSQL本文略过不提。
+##序列化/反序列化
+基本想法是，JONGO既然可以将实体对象转换成JSON数据，并将取出的JSON数据反序列化成实体对象。那么我们就基于JONGO的这种能力做二次开发。
+有一点值得庆幸，JONGO是开源的，我们得以深入到JONGO去研究其内部实现，并且在尽量不修改JONGO的前提下获得这种能力。
+###序列化
+实体对象->DBObject
+```
+public DBObject convertToDBObject(T t)
+{
+  //先将对象转换为BsonDocument
+  BsonDocument document=asBsonDocument(mapper.getMarshaller(),t);
+  return document.toDBObject();
+}
+```
+DBObject处理
+```
+private BasicDBObject doSerializeProcess(DBObject dbObject)
+{
+  BasicDBObject basicDBObject = new BasicDBObject();
+  for (String key : dbObject.keySet())
+  {
+    Object obj = dbObject.get(key);
+    //根据类型，查找是否存在自定义转换器，存在则做二次处理
+    UserConverter converter=userConverters.get(obj.getClass());
+    if (converter != null)
+    {
+      obj = converter.serialize(obj);
+    }
+    basicDBObject.put(key, obj);
+  }
+  return basicDBObject;
+}
+```
+DBObject -> Json
+```
+public String convertToJson(BasicDBObject basicDBObject)
+{
+  return basicDBObject.toString();
+}
+```
+###反序列化
+Json -> DBObject
+```
+public DBObject convertToDBObject(String json)
+{
+  return (DBObject)JSON.parse(json);
+}
+```
+DBObject处理
+```
+private DBObject doUnserializeProcess(DBObject dbObject, Class entityClass)
+{
+  Class tempClass = entityClass;
+  //处理存在基类的继承场景
+  while (!Object.class.equals(tempClass))
+  {
+    for (Field field : tempClass.getDeclaredFields())
+    {
+      String name = field.getName();
+      Object value = dbObject.get(name);
+      UserConverter converter=userConverters.get(field.getType());
+      if (parser != null)
+      {
+        value = parser.unserialize((String)value);
+      }
+      dbObject.put(name, value);
+    }
+    tempClass = tempClass.getSuperclass();
+  }
+}
+```
+DBObject -> 实体对象
+```
+private T convertToEntity(DBObject dbObject)
+{
+  //转换为实体类
+  BsonDocument document = Bson.createDocument(dbObject);
+  return mapper.getUnmarshaller().unmarshall(document, entityClass);
+}
+```
+UserConverter用于处理特殊数据类型，即那些Mongo做了特殊处理导致无法使用标准的jsonb语法做正确存储、查询的类型。先来看UserConverter的定义:
+```
+public interface UserConverter
+{
+  public String serialize(T obj);
+  public T unserialize(String value);
+}
+```
+当前系统中，我们识别到的特殊类型包括UUID、Date两种类型，具体实现是相对自由的，此处略过不提。
+实际上除了上述讨论的内容，还有三点需要说明
+1. 除了Date、UUID两种类型，还有一种byte[]类型是需要外处理的。
+2. JONGO实际上自身已经支持自定义转换器。
+到这里你可能心里暗骂：麻蛋，明明知道JONGO支持自定义转换器还要自定义；明明是Date、UUID、byte[]三种类型需要处理却说是两种(-_-!!)......
+OK，让我来解释下。JONGO支持的自定义转换器只针对非内置类型，而Date、UUID被认定为内置类型。byte[]为非内置类型，因此可以使用自身的自定义转换器。
+3. Java是面向对象的，当实体对象中包含了基类或接口对象时，其存放的实体可能是基类的继承类或接口的实现类。这在序列化时没有问题，但反序列化时，由于类型丢失，一个接口并不知道要转换成哪种实现类，基类场景则只能退化为基类。针对这类场景，Mongo已有解决方案，我们利用该特性并做了易用性简化。
+
+```
+public void addTypeAdapter(Class origType, Class realType)
+{
+  builder.addDeserializer(origType, new JsonDeserializer()
+  {
+    @Override
+    public T deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException, JsonProcessingException
+    {
+      return jp.readValueAs(realType);
+    }
+  });
+  mapper = builder.build();
+}
+```
+#结束语
+至此，MongoDB切换PostgreSQL工程实践上遇到的各种问题、解决方案、部分技术细节做了详述。可能基于此文，你还是无法将MongoDB切换到PostgreSQL或者其他数据库，但希望至少是有帮助的。
+当然，本文还有很多没有深入、甚至没有提及。如MongoDB中_id默认字段的处理方式、对jsonb数据增加索引以提高性能，或者语法树上的各种技术细节。再比如针对数据库切换后的扩、减容策略，可靠性机制等。
+最后，如果你正在做数据库接口设计，请尽量避免将其和具体的数据库绑定，万一真的出现需要切换数据库的场景将会为你节省大量的工作。退一步讲，即便没有更换数据库的诉求，接口和实现解耦本身也是架构师应该具备的基本能力。
+
+---
+转载请注明：(随安居士)http://www.jianshu.com/p/309f876be20a

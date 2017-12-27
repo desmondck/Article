@@ -1,0 +1,376 @@
+**目录**
+[1. PhxPaxos源码分析之关于PhxPaxos](http://www.jianshu.com/p/9f1a874a39e5)
+[2. PhxPaxos分析之网络基础部件](http://www.jianshu.com/p/d9434ef602b3)
+[3. PhxPaxos源码分析之Proposer、Acceptor](http://www.jianshu.com/p/2a78c6215e6d)
+[4. PhxPaxos源码分析之Learner](http://www.jianshu.com/p/ab4a33989a98)
+[5. PhxPaxos源码分析之状态机](http://www.jianshu.com/p/89377cc9b405)
+[6. PhxPaxos源码分析之归档机制](http://www.jianshu.com/p/a43fa22a2851)
+[7. PhxPaxos源码分析之整体架构](http://www.jianshu.com/p/01f048419328)
+****
+#4.1 基本概念
+在Paxos中Learner角色负责向其他节点学习选中的提案值。具体包括如下两种场景：
+* Learner所在节点参与了提案选举，Learner需要知道其接受(accept)的提案值是否被选中(chosen)。
+* Learner所在节点已落后于其他节点，Learner需要选择合适的策略快速完成追赶，并重新参与到提案选举当中。
+
+#4.2 选中(chosen)通知
+当本节点Proposer的某个提案被选中(chosen)时，通过(MsgType_PaxosLearner_ProposerSendSuccess)消息通知到各个节点，代码如下：
+```
+void Learner::OnProposerSendSuccess(const PaxosMsg &oPaxosMsg)
+{
+    BP->GetLearnerBP()->OnProposerSendSuccess();
+
+    PLGHead("START Msg.InstanceID %lu Now.InstanceID %lu Msg.ProposalID %lu State.AcceptedID %lu "
+            "State.AcceptedNodeID %lu, Msg.from_nodeid %lu",
+            oPaxosMsg.instanceid(), GetInstanceID(), oPaxosMsg.proposalid(),
+            m_poAcceptor->GetAcceptorState()->GetAcceptedBallot().m_llProposalID,
+            m_poAcceptor->GetAcceptorState()->GetAcceptedBallot().m_llNodeID,
+            oPaxosMsg.nodeid());
+
+    if (oPaxosMsg.instanceid() != GetInstanceID())
+    {
+        //Instance id not same, that means not in the same instance, ignord.
+        PLGDebug("InstanceID not same, skip msg");
+        return;
+    }
+
+    if (m_poAcceptor->GetAcceptorState()->GetAcceptedBallot().isnull())
+    {
+        //Not accept any yet.
+        BP->GetLearnerBP()->OnProposerSendSuccessNotAcceptYet();
+        PLGDebug("I haven't accpeted any proposal");
+        return;
+    }
+
+    BallotNumber oBallot(oPaxosMsg.proposalid(), oPaxosMsg.nodeid());
+
+    if (m_poAcceptor->GetAcceptorState()->GetAcceptedBallot() != oBallot)
+    {
+        //Proposalid not same, this accept value maybe not chosen value.
+        PLGDebug("ProposalBallot not same to AcceptedBallot");
+        BP->GetLearnerBP()->OnProposerSendSuccessBallotNotSame();
+        return;
+    }
+
+    //learn value.
+    m_oLearnerState.LearnValueWithoutWrite(
+        oPaxosMsg.instanceid(),
+        m_poAcceptor->GetAcceptorState()->GetAcceptedValue(),
+        m_poAcceptor->GetAcceptorState()->GetChecksum());
+
+    BP->GetLearnerBP()->OnProposerSendSuccessSuccessLearn();
+
+    PLGHead("END Learn value OK, value %zu", m_poAcceptor->GetAcceptorState()->GetAcceptedValue().size());
+
+    TransmitToFollower();
+}
+```
+正常情况下，所有节点处于online状态，共同参与paxos选举。因此，各个节点的instance id一致。为了避免冲突，paxos建议只由主节点的proposer发起提案，这样保证接受提案和习得提案编号一致。
+
+此时，Learn习得的提案值实际上就是本节点Accept的数据，因此learner只更新内存状态即可，无需再次落盘(acceptor已落盘)。最后，如果存在follower节点，数据同步到follower(follower节点不参与paxos算法，相当于某个paxos节点的同步备)。
+#4.3 提案值追赶
+一旦节点处于落后状态，它无法再参与到paxos提案选举中来。这时需要由learner发起主动学习完成追赶。
+
+PhxPaxos启动时，启动learner定时器。learner定时发送learn请求到各个节点，发送请求携带本节点的Instance ID、Node ID信息。各节点收到该请求后，处理逻辑如下：
+```
+    //本节点无可学习数据，跳过本次请求
+    if (oPaxosMsg.instanceid() >= GetInstanceID())
+    {
+        return;
+    }
+    //本节点有可学习数据，且本节点保存了此部分的paxos log
+    if (oPaxosMsg.instanceid() >= m_poCheckpointMgr->GetMinChosenInstanceID())
+    {
+        //通知Learner Sender发送数据
+        if (!m_oLearnerSender.Prepare(oPaxosMsg.instanceid(), oPaxosMsg.nodeid()))
+        {
+            BP->GetLearnerBP()->OnAskforLearnGetLockFail();
+
+            PLGErr("LearnerSender working for others.");
+            //如本节点正在处理其他节点的learn请求，但发起者只少了一条记录，绕过Learner Sender发送。
+            if (oPaxosMsg.instanceid() == (GetInstanceID() - 1))
+            {
+                PLGImp("InstanceID only difference one, just send this value to other.");
+                //send one value
+                AcceptorStateData oState;
+                int ret = m_oPaxosLog.ReadState(m_poConfig->GetMyGroupIdx(), oPaxosMsg.instanceid(), oState);
+                if (ret == 0)
+                {
+                    BallotNumber oBallot(oState.acceptedid(), oState.acceptednodeid());
+                    SendLearnValue(oPaxosMsg.nodeid(), oPaxosMsg.instanceid(), oBallot, oState.acceptedvalue(), 0, false);
+                }
+            }
+            //如果Leaner Sender正在处理其他节点请求，跳过本次请求
+            return;
+        }
+    }
+
+    //本节点有可学习数据，并且本节点当前并未处理其他节点的Learn请求，发送本节点信息给发起者
+    SendNowInstanceID(oPaxosMsg.instanceid(), oPaxosMsg.nodeid());
+```
+当接收节点有可学习数据，并且当前并未处理其他节点的Learn请求，发送如下信息包括：本节点的node id、当前的instance id、min chosen instance id、请求的instance id；除此之外，当paxos log差距超过50，那么两边的主节点信息、集群信息可能不同，发送此部分数据。发起者可能依次接收到多个节点请求，需要二次确认：
+```
+    //当初请求的instance id和本节点已不一致，说明已通过其他方式开始习得
+    if (oPaxosMsg.instanceid() != GetInstanceID())
+    {
+        PLGErr("Lag msg, skip");
+        return;
+    }
+    //本节点已经追赶甚至超过了接受节点的paxos log，跳过
+    if (oPaxosMsg.nowinstanceid() <= GetInstanceID())
+    {
+        PLGErr("Lag msg, skip");
+        return;
+    }
+    //本节点数据落后太多，接受节点已无完整的paxos log数据，尝试进入Checkpoint模式
+    if (oPaxosMsg.minchoseninstanceid() > GetInstanceID())
+    {
+        BP->GetCheckpointBP()->NeedAskforCheckpoint();
+
+        PLGHead("my instanceid %lu small than other's minchoseninstanceid %lu, other nodeid %lu",
+                GetInstanceID(), oPaxosMsg.minchoseninstanceid(), oPaxosMsg.nodeid());
+
+        AskforCheckpoint(oPaxosMsg.nodeid());
+    }
+    else if (!m_bIsIMLearning)
+    {
+        //接受节点有可习得的完整数据，向接受节点确认习得请求
+        ComfirmAskForLearn(oPaxosMsg.nodeid());
+    }
+```
+其实上面做了这么多，简单讲就是：如果本节点在请求这段时间内并未进行自主学习，并且也没有其他节点在此之前通知本节点开始学习，本节点发送确认请求到learn接收者，准备开始接受learn数据。learn接受者收到确认请求激活learner sender线程，发送paxos log数据。
+#4.4 Learner Sender
+Learner Sender发送本节点数据到请求节点。为了避免learn操作造成网络拥塞，在数据发送前做了限流。
+```
+void LearnerSender :: SendLearnedValue(const uint64_t llBeginInstanceID, const nodeid_t iSendToNodeID)
+{
+    PLGHead("BeginInstanceID %lu SendToNodeID %lu", llBeginInstanceID, iSendToNodeID);
+
+    uint64_t llSendInstanceID = llBeginInstanceID;
+    int ret = 0;
+    
+    uint32_t iLastChecksum = 0;
+
+    //control send speed to avoid affecting the network too much.
+    int iSendQps = LearnerSender_SEND_QPS;
+    int iSleepMs = iSendQps > 1000 ? 1 : 1000 / iSendQps;
+    int iSendInterval = iSendQps > 1000 ? iSendQps / 1000 + 1 : 1; 
+
+    PLGDebug("SendQps %d SleepMs %d SendInterval %d AckLead %d",
+            iSendQps, iSleepMs, iSendInterval, m_iAckLead);
+
+    int iSendCount = 0;
+    while (llSendInstanceID < m_poLearner->GetInstanceID())
+    {    
+        ret = SendOne(llSendInstanceID, iSendToNodeID, iLastChecksum);
+        if (ret != 0)
+        {
+            PLGErr("SendOne fail, SendInstanceID %lu SendToNodeID %lu ret %d",
+                    llSendInstanceID, iSendToNodeID, ret);
+            return;
+        }
+
+        if (!CheckAck(llSendInstanceID))
+        {
+            return;
+        }
+
+        iSendCount++;
+        llSendInstanceID++;
+        ReleshSending();
+
+        if (iSendCount >= iSendInterval)
+        {
+            iSendCount = 0;
+            Time::MsSleep(iSleepMs);
+        }
+    }
+
+    //succ send, reset ack lead.
+    m_iAckLead = LearnerSender_ACK_LEAD;
+    PLGImp("SendDone, SendEndInstanceID %lu", llSendInstanceID);
+}
+```
+注意，这里的while循环判定逻辑为while (llSendInstanceID < m_poLearner->GetInstanceID())，即只追赶到当前instance id的前一条。这是因为learner当前所处的instance id可能尚未完成提案，但这之前的提案是已选中(chosen)的。单条paxos log发送逻辑如下：
+```
+int LearnerSender :: SendOne(const uint64_t llSendInstanceID, const nodeid_t iSendToNodeID, uint32_t & iLastChecksum)
+{
+    BP->GetLearnerBP()->SenderSendOnePaxosLog();
+
+    AcceptorStateData oState;
+    int ret = m_poPaxosLog->ReadState(m_poConfig->GetMyGroupIdx(), llSendInstanceID, oState);
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    BallotNumber oBallot(oState.acceptedid(), oState.acceptednodeid());
+
+    ret = m_poLearner->SendLearnValue(iSendToNodeID, llSendInstanceID, oBallot, oState.acceptedvalue(), iLastChecksum);
+
+    iLastChecksum = oState.checksum();
+
+    return ret;
+}
+```
+#4.5 更快的对齐数据
+下述文字截取自[《微信自研生产级paxos类库PhxPaxos实现原理介绍》](https://mp.weixin.qq.com/s?__biz=MzI4NDMyNTU2Mw==&mid=2247483695&idx=1&sn=91ea422913fc62579e020e941d1d059e#rd)。
+>上文说到当各台机器的当前运行实例编号不一致的时候，就需要Learner介入工作来对齐数据了。Learner通过其他机器拉取到当前实例的chosen value，从而跳转到下一编号的实例，如此反复最终将自己的实例编号更新到与其他机器一致。那么这里学习一个实例的网络延时代价是一个RTT。可能这个延迟看起来还不错，但是当新的数据仍然通过一个RTT的代价不断写入的时候，而落后的机器仍然以一个RTT来进行学习，这样会出现很难追上的情况。
+>
+>这里需要改进，我们可以提前获取差距，批量打包进行学习，比如A机器Learner记录当前实例编号是x，B机器是y，而x < y，那么B机器通过通信获取这个差距，将(x,y]的chosen value一起打包发送给A机器，A机器进行批量的学习。这是一个很不错的方法。
+>
+>但仍然不够快，当落后的数据极大，B机器发送数据需要的网络耗时也将变大，那么发送数据的过程中，A机器处于一种空闲状态，由于paxos另外一个瓶颈在于写盘，如果不能利用这段时间来进行写盘，那性能仍然堪忧。我们参考流式传输，采用类似的方法实现Learner的边发边学，B机器源源不断的往A机器输送数据，而A机器只需要收到一个实例最小单元的包体，即可立即解开进行学习并完成写盘。
+>
+>具体的实现大概是先进行一对一的协商，建立一个Session通道，在Session通道里直接采用直塞的方式无脑发送数据。当然也不是完全的无脑，Session通过心跳机制进行维护，一旦Session断开即停止发送。
+
+“我们参考流式传输，采用类似的方法实现Learner的边发边学，B机器源源不断的往A机器输送数据，而A机器只需要收到一个实例最小单元的包体，即可立即解开进行学习并完成写盘。”。这部分实际上封装在网络层，来看如何做到A机器接收到一个最小的实例单元：
+```
+int MessageEvent :: OnRead()
+{
+    if (m_iLeftReadLen > 0)
+    {
+        return ReadLeft();
+    }
+    
+    int iReadLen = m_oSocket.receive(m_sReadHeadBuffer + m_iLastReadHeadPos, sizeof(int) - m_iLastReadHeadPos);
+    if (iReadLen == 0)
+    {
+        BP->GetNetworkBP()->TcpOnReadMessageLenError();
+           PLErr("read head fail, readlen %d, socket broken", iReadLen);
+        return -1;
+    }
+
+    m_iLastReadHeadPos += iReadLen;
+    if (m_iLastReadHeadPos < (int)sizeof(int))
+    {
+        PLImp("head read pos %d small than sizeof(int) %zu", m_iLastReadHeadPos, sizeof(int));
+        return 0;
+    }
+    
+    m_iLastReadHeadPos = 0;
+    int niLen = 0;
+    int iLen = 0;
+    memcpy((char *)&niLen, m_sReadHeadBuffer, sizeof(int));
+    iLen = ntohl(niLen) - 4;
+    
+    if (iLen < 0 || iLen > MAX_VALUE_SIZE)
+    {
+        PLErr("need to read len wrong %d", iLen);
+        return -2; 
+    }
+
+    m_oReadCacheBuffer.Ready(iLen);
+
+    m_iLeftReadLen = iLen;
+    m_iLastReadPos = 0;
+    
+    //second read maybe no data read, so readlen == 0 is ok.
+    bool bAgain = false;
+    iReadLen = m_oSocket.receive(m_oReadCacheBuffer.GetPtr(), iLen, &bAgain);
+    if (iReadLen == 0)
+    {
+        if (!bAgain)
+        {
+            PLErr("second read data fail, readlen %d, no again, socket broken", iReadLen);
+            return -1;
+        }
+        else
+        {
+            PLErr("second read data, readlen %d need again", iReadLen);
+            return 0;
+        }
+    }
+
+    if (iReadLen == iLen)
+    {
+        ReadDone(m_oReadCacheBuffer, iLen);
+        m_iLeftReadLen = 0;
+        m_iLastReadPos = 0;
+    }
+    else if (iReadLen < iLen)
+    {
+        m_iLastReadPos = iReadLen;
+        m_iLeftReadLen = iLen - iReadLen;
+
+        PLImp("read buflen %d small than except len %d", iReadLen, iLen);
+    }
+    else
+    {
+        PLErr("read buflen %d large than except len %d", iReadLen, iLen);
+        return -2;
+    }
+
+    return 0;
+}
+```
+OnRead函数由以下两部分组成：
+* 首先读取数据包大小，这个过程可能需要分多次完成。
+* 读取指定数据包大小的数据，这部分也可能需要分多次完成。
+
+当单个数据包读完，已获得完整的“最小实例单元”，通过ReadDone将数据包发往Node节点处理。
+
+至于心跳，其实就是PhxPaxos中的Ack机制。在SendLearnedValue中，每发送一条记录需要执行一次CheckAck。如果检查失败，将终止发送。每条记录发送后，learner sender要求对端发送一个异步的ack请求，这个过程是异步的。CheckAck逻辑如下：
+```
+const bool LearnerSender :: CheckAck(const uint64_t llSendInstanceID)
+{
+    m_oLock.Lock();
+
+    if (llSendInstanceID < m_llAckInstanceID)
+    {
+        m_iAckLead = LearnerSender_ACK_LEAD;
+        PLGImp("Already catch up, ack instanceid %lu now send instanceid %lu", 
+                m_llAckInstanceID, llSendInstanceID);
+        m_oLock.UnLock();
+        return false;
+    }
+    //如果当前发送的instance id和对端已确认的instance id差距超过了设定值
+    while (llSendInstanceID > m_llAckInstanceID + m_iAckLead)
+    {
+        uint64_t llNowTime = Time::GetSteadyClockMS();
+        uint64_t llPassTime = llNowTime > m_llAbsLastAckTime ? llNowTime - m_llAbsLastAckTime : 0;
+         //同时，超过了设定的超时时间，提前终止
+        if ((int)llPassTime >= LearnerSender_ACK_TIMEOUT)
+        {
+            BP->GetLearnerBP()->SenderAckTimeout();
+            PLGErr("Ack timeout, last acktime %lu now send instanceid %lu", 
+                    m_llAbsLastAckTime, llSendInstanceID);
+            CutAckLead();
+            m_oLock.UnLock();
+            return false;
+        }
+
+        BP->GetLearnerBP()->SenderAckDelay();
+        //PLGErr("Need sleep to slow down send speed, sendinstaceid %lu ackinstanceid %lu",
+                //llSendInstanceID, m_llAckInstanceID);
+        
+        m_oLock.WaitTime(20);
+    }
+
+    m_oLock.UnLock();
+
+    return true;
+}
+```
+#4.6 关于选中(chosen)
+在整个讲解learner中，我们一直在强调选中(chosen)提案或者选中(chosen)值。这个过程提出以下疑问，并尝试解答。
+
+*问：learner如何知道某个提案是否被选中呢？*
+**答：“4.2 选中通知”是通知各个learner值是否已被选中的一种常规方式。**
+
+*问：如果某个值被选中后，提案发起节点异常，选中消息未发出会如何？*
+**答：重新发起选举，新的被选中的提案编号不同，但提案值保持不变。**
+
+*问：“4.2 选中通知”中，只更新了内存状态，在持久化的数据中，如何区分一个值的状态是accept还是chosen呢？*
+**答： 如果当前的instance id为N，在N-1之前的所有提案值都是chosen的。当instance id为N的提案值可能是chosen状态、也可能是accept状态。**
+
+*问：为何非chosen状态的数据也需要落盘*
+**答：参见P2C的不变性，即Prepare和Accept阶段做过的承诺、接受过的值即便节点重启等异常情况下也需要保持不变。**
+
+*问：我还有一个关于Instance类初始化的问题。*
+**答：Instance类本章尚未涉及，留在第七章解答吧。**
+
+#4.6 总结
+经过第三、第四两章的讲解，paxos协议的算法实现已经分析完成。PhxPaxos并未对paxos做任何变种，甚至还做了一点简化。
+
+下一节，我们将介绍paxos made simple中另外一个重要的概念：状态机。当然，这里提到的“简化”也会提及。
+****
+【转载请注明】随安居士. [4. PhxPaxos源码分析之Learner](http://www.jianshu.com/p/ab4a33989a98). 2017.11.15
